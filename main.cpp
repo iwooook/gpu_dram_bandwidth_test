@@ -4,10 +4,22 @@
 #include <chrono>
 #include <cstdlib>
 
+// using DataType = float;
+
+// #if 0
+// using float16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
+// using VecType = float16;
+// #else
+// using VecType = float4;
+// #endif
+
+using DataType = int;
+
 #if 0
-using DataType = int4;
+using int16 = __attribute__((__vector_size__(16 * sizeof(int)))) int;
+using VecType = int16;
 #else
-using DataType = float4;
+using VecType = int4;
 #endif
 
 #define CHECK_HIP_ERROR(call) \
@@ -22,61 +34,66 @@ using DataType = float4;
 #define N_THREADS_PER_BLOCK 256
 
 template <typename T>
-__global__ void ReadWriteKernel(T *a, T *b, size_t N, size_t num_chunks, T factor) {
+__global__ void ReadWriteKernel(T *a, T *b, size_t N, size_t num_chunks) {
     extern __shared__ T _tmp[];
     size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     size_t tid = threadIdx.x;
     size_t chunk_size = N / num_chunks; // stride
 
+    constexpr size_t VEC_WIDTH = sizeof(T) / sizeof(DataType);
+    size_t vec_idx = idx / VEC_WIDTH;
+
     if (idx < chunk_size) {
         for (size_t i = 0; i < num_chunks; i++) {
-            _tmp[i * N_THREADS_PER_BLOCK + tid].x = a[i * chunk_size + idx].x;
-            _tmp[i * N_THREADS_PER_BLOCK + tid].y = a[i * chunk_size + idx].y;
-            _tmp[i * N_THREADS_PER_BLOCK + tid].z = a[i * chunk_size + idx].z;
-            _tmp[i * N_THREADS_PER_BLOCK + tid].w = a[i * chunk_size + idx].w;
+            T *src = reinterpret_cast<T *>(a + i * chunk_size + idx);
+            T *dst = reinterpret_cast<T *>(_tmp + i * N_THREADS_PER_BLOCK + tid);
+            dst[0] = src[0];
         }
         __syncthreads();
         for (size_t i = 0; i < num_chunks; i++) {
-            b[i * chunk_size + idx].x = _tmp[i * N_THREADS_PER_BLOCK + tid].x;
-            b[i * chunk_size + idx].y = _tmp[i * N_THREADS_PER_BLOCK + tid].y;
-            b[i * chunk_size + idx].z = _tmp[i * N_THREADS_PER_BLOCK + tid].z;
-            b[i * chunk_size + idx].w = _tmp[i * N_THREADS_PER_BLOCK + tid].w;
-        }
-    }
+            T *src = reinterpret_cast<T *>(_tmp + i * N_THREADS_PER_BLOCK + tid);
+            T *dst = reinterpret_cast<T *>(b + i * chunk_size + idx);
+            dst[0] = src[0];
+        }        
+    }        
 }
 
 template <typename T>
-__global__ void ReadKernel(T *a, T *b, size_t N, size_t num_chunks, T factor) {
+__global__ void ReadKernel(T *a, T *b, size_t N, size_t num_chunks) {
     extern __shared__ T _tmp[];
     size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     size_t tid = threadIdx.x;
     size_t chunk_size = N / num_chunks; // stride
 
+    constexpr size_t VEC_WIDTH = sizeof(T) / sizeof(DataType);
+    size_t vec_idx = idx / VEC_WIDTH;
+
     if (idx < chunk_size) {
         for (size_t i = 0; i < num_chunks; i++) {
-            _tmp[i * N_THREADS_PER_BLOCK + tid].x = a[i * chunk_size + idx].x;
-            _tmp[i * N_THREADS_PER_BLOCK + tid].y = a[i * chunk_size + idx].y;
-            _tmp[i * N_THREADS_PER_BLOCK + tid].z = a[i * chunk_size + idx].z;
-            _tmp[i * N_THREADS_PER_BLOCK + tid].w = a[i * chunk_size + idx].w;
+            T *src = reinterpret_cast<T *>(a + i * chunk_size + idx);
+            T *dst = reinterpret_cast<T *>(_tmp + i * N_THREADS_PER_BLOCK + tid);
+            dst[0] = src[0];
         }
-    }
+    }    
 }
 
 template <typename T>
-__global__ void WriteKernel(T *a, T *b, size_t N, size_t num_chunks, T factor) {
+__global__ void WriteKernel(T *a, T *b, size_t N, size_t num_chunks) {
     extern __shared__ T _tmp[];
     size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     size_t tid = threadIdx.x;
     size_t chunk_size = N / num_chunks; // stride
 
+    constexpr size_t VEC_WIDTH = sizeof(T) / sizeof(DataType);
+    size_t vec_idx = idx / VEC_WIDTH;
+
     if (idx < chunk_size) {
         for (size_t i = 0; i < num_chunks; i++) {
-            b[i * chunk_size + idx].x = _tmp[i * N_THREADS_PER_BLOCK + tid].x;
-            b[i * chunk_size + idx].y = _tmp[i * N_THREADS_PER_BLOCK + tid].y;
-            b[i * chunk_size + idx].z = _tmp[i * N_THREADS_PER_BLOCK + tid].z;
-            b[i * chunk_size + idx].w = _tmp[i * N_THREADS_PER_BLOCK + tid].w;
-        }
-    }
+            T *src = reinterpret_cast<T *>(_tmp + i * N_THREADS_PER_BLOCK + tid);
+            T *dst = reinterpret_cast<T *>(b + i * chunk_size + idx);
+            dst[0] = src[0];
+        }        
+    } 
 }
 
 int main(int argc, char** argv) {
@@ -96,49 +113,48 @@ int main(int argc, char** argv) {
     std::cout << "num_elems: " << num_elems << ", num_blocks=" << num_blocks << ", num_devs=" << num_devs << ", num_chunks=" << num_chunks << ", num_iter=" << num_iter << std::endl;
 
     // kernel function pointer
-    void (*kernel)(DataType *, DataType *, size_t, size_t, DataType);
+    void (*kernel)(VecType *, VecType *, size_t, size_t);
 
     if (test_type == 0) {
         std::cout << "testing: read, write" << std::endl;
-        kernel = ReadWriteKernel<DataType>;
+        kernel = ReadWriteKernel<VecType>;
     } else if (test_type == 1) {
         std::cout << "testing: read only" << std::endl;
-        kernel = ReadKernel<DataType>;
+        kernel = ReadKernel<VecType>;
     } else if (test_type == 2) {
         std::cout << "testing: write only" << std::endl;
-        kernel = WriteKernel<DataType>;
+        kernel = WriteKernel<VecType>;
     } else {
         std::cerr << "Invalid test type" << std::endl;
         return 1;
     }
 
-    std::cout << "size per block = " << (float)num_elems * sizeof(DataType) / 1024 / 1024 << " MB" << std::endl;
+    std::cout << "size per block = " << (float)num_elems * sizeof(VecType) / 1024 / 1024 << " MB" << std::endl;
 
     // Allocate host and device memory
-    DataType* h_data = new DataType[num_elems];
-    DataType* d_data_a;
-    DataType* d_data_b;
-    CHECK_HIP_ERROR(hipMalloc(&d_data_a, num_elems * sizeof(DataType)));
-    CHECK_HIP_ERROR(hipMalloc(&d_data_b, num_elems * sizeof(DataType)));
+    VecType* h_data = new VecType[num_elems];
+    VecType* d_data_a;
+    VecType* d_data_b;
+    CHECK_HIP_ERROR(hipMalloc(&d_data_a, num_elems * sizeof(VecType)));
+    CHECK_HIP_ERROR(hipMalloc(&d_data_b, num_elems * sizeof(VecType)));
 
     // Initialize host data
     for (size_t i = 0; i < num_elems; i++) {
-        h_data[i] = {static_cast<float>(i % 100), static_cast<float>((i + 1) % 100),
-                     static_cast<float>((i + 2) % 100), static_cast<float>((i + 3) % 100)};
+        //
     }
 
     // Copy data from host to device
-    CHECK_HIP_ERROR(hipMemcpy(d_data_a, h_data, num_elems * sizeof(DataType), hipMemcpyHostToDevice));
+    CHECK_HIP_ERROR(hipMemcpy(d_data_a, h_data, num_elems * sizeof(VecType), hipMemcpyHostToDevice));
 
     const int threads_per_block = N_THREADS_PER_BLOCK;
-    dim3 grids((num_elems + threads_per_block - 1) / threads_per_block);
+    dim3 grids((num_elems + threads_per_block - 1) / threads_per_block / num_chunks);
     dim3 blocks(threads_per_block);
 
     // Warm-up kernel launch
     std::cout << "Warming up..." << std::endl;
     for (size_t i = 0; i < 5; i++) {
       hipLaunchKernelGGL(kernel, grids, blocks, 
-                         threads_per_block * num_chunks * sizeof(DataType), 0, d_data_a, d_data_b, num_elems, num_chunks, DataType{1.0f, 1.0f, 1.0f, 1.0f});
+                         threads_per_block * num_chunks * sizeof(VecType), 0, d_data_a, d_data_b, num_elems, num_chunks);
     }
     CHECK_HIP_ERROR(hipDeviceSynchronize());
     std::cout << "Warming up done." << std::endl;
@@ -149,7 +165,7 @@ int main(int argc, char** argv) {
 
     for (size_t i = 0; i < num_iter; i++) {
         hipLaunchKernelGGL(kernel, grids, blocks,
-                           threads_per_block * num_chunks * sizeof(DataType), 0, d_data_a, d_data_b, num_elems, num_chunks, DataType{1.0f, 1.0f, 1.0f, 1.0f});
+                           threads_per_block * num_chunks * sizeof(VecType), 0, d_data_a, d_data_b, num_elems, num_chunks);
     }
     CHECK_HIP_ERROR(hipDeviceSynchronize());
 
@@ -160,7 +176,7 @@ int main(int argc, char** argv) {
     std::chrono::duration<double> elapsed = end - start;
 
     // Calculate bandwidth (in GB/s)
-    double total_bytes = static_cast<double>(num_elems * sizeof(DataType) * num_iter * 1);
+    double total_bytes = static_cast<double>(num_elems * sizeof(VecType) * num_iter);
     if (test_type == 0) {
         total_bytes *= 2;
     }
