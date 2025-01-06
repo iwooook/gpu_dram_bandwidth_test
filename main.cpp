@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <iostream>
 #include <hip/hip_runtime.h>
 #include <chrono>
@@ -21,14 +22,13 @@ using DataType = float4;
 #define N_THREADS_PER_BLOCK 256
 
 template <typename T>
-__global__ void memoryBandwidthKernel(T *a, T *b, size_t N, size_t num_chunks, T factor) {
+__global__ void ReadWriteKernel(T *a, T *b, size_t N, size_t num_chunks, T factor) {
     extern __shared__ T _tmp[];
     size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     size_t tid = threadIdx.x;
     size_t chunk_size = N / num_chunks; // stride
 
     if (idx < chunk_size) {
-        // Read-Write
         for (size_t i = 0; i < num_chunks; i++) {
             _tmp[i * N_THREADS_PER_BLOCK + tid].x = a[i * chunk_size + idx].x;
             _tmp[i * N_THREADS_PER_BLOCK + tid].y = a[i * chunk_size + idx].y;
@@ -45,9 +45,43 @@ __global__ void memoryBandwidthKernel(T *a, T *b, size_t N, size_t num_chunks, T
     }
 }
 
+template <typename T>
+__global__ void ReadKernel(T *a, T *b, size_t N, size_t num_chunks, T factor) {
+    extern __shared__ T _tmp[];
+    size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    size_t tid = threadIdx.x;
+    size_t chunk_size = N / num_chunks; // stride
+
+    if (idx < chunk_size) {
+        for (size_t i = 0; i < num_chunks; i++) {
+            _tmp[i * N_THREADS_PER_BLOCK + tid].x = a[i * chunk_size + idx].x;
+            _tmp[i * N_THREADS_PER_BLOCK + tid].y = a[i * chunk_size + idx].y;
+            _tmp[i * N_THREADS_PER_BLOCK + tid].z = a[i * chunk_size + idx].z;
+            _tmp[i * N_THREADS_PER_BLOCK + tid].w = a[i * chunk_size + idx].w;
+        }
+    }
+}
+
+template <typename T>
+__global__ void WriteKernel(T *a, T *b, size_t N, size_t num_chunks, T factor) {
+    extern __shared__ T _tmp[];
+    size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    size_t tid = threadIdx.x;
+    size_t chunk_size = N / num_chunks; // stride
+
+    if (idx < chunk_size) {
+        for (size_t i = 0; i < num_chunks; i++) {
+            b[i * chunk_size + idx].x = _tmp[i * N_THREADS_PER_BLOCK + tid].x;
+            b[i * chunk_size + idx].y = _tmp[i * N_THREADS_PER_BLOCK + tid].y;
+            b[i * chunk_size + idx].z = _tmp[i * N_THREADS_PER_BLOCK + tid].z;
+            b[i * chunk_size + idx].w = _tmp[i * N_THREADS_PER_BLOCK + tid].w;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
-    if (argc != 6) {
-        std::cerr << "Usage: ./mem <num_elems> <num_blocks> <num_devs> <num_chunks> <num_iter>" << std::endl;
+    if (argc != 7) {
+        std::cerr << "Usage: ./mem <num_elems> <num_blocks> <num_devs> <num_chunks> <num_iter> <test_type>" << std::endl;
         return 1;
     }
 
@@ -57,8 +91,27 @@ int main(int argc, char** argv) {
     size_t num_devs = std::atoi(argv[3]);
     size_t num_chunks = std::atoi(argv[4]);
     size_t num_iter = std::atoi(argv[5]);
+    size_t test_type = std::atoi(argv[6]);
 
     std::cout << "num_elems: " << num_elems << ", num_blocks=" << num_blocks << ", num_devs=" << num_devs << ", num_chunks=" << num_chunks << ", num_iter=" << num_iter << std::endl;
+
+    // kernel function pointer
+    void (*kernel)(DataType *, DataType *, size_t, size_t, DataType);
+
+    if (test_type == 0) {
+        std::cout << "testing: read, write" << std::endl;
+        kernel = ReadWriteKernel<DataType>;
+    } else if (test_type == 1) {
+        std::cout << "testing: read only" << std::endl;
+        kernel = ReadKernel<DataType>;
+    } else if (test_type == 2) {
+        std::cout << "testing: write only" << std::endl;
+        kernel = WriteKernel<DataType>;
+    } else {
+        std::cerr << "Invalid test type" << std::endl;
+        return 1;
+    }
+
     std::cout << "size per block = " << (float)num_elems * sizeof(DataType) / 1024 / 1024 << " MB" << std::endl;
 
     // Allocate host and device memory
@@ -84,7 +137,7 @@ int main(int argc, char** argv) {
     // Warm-up kernel launch
     std::cout << "Warming up..." << std::endl;
     for (size_t i = 0; i < 5; i++) {
-      hipLaunchKernelGGL((memoryBandwidthKernel<DataType>), grids, blocks, 
+      hipLaunchKernelGGL(kernel, grids, blocks, 
                          threads_per_block * num_chunks * sizeof(DataType), 0, d_data_a, d_data_b, num_elems, num_chunks, DataType{1.0f, 1.0f, 1.0f, 1.0f});
     }
     CHECK_HIP_ERROR(hipDeviceSynchronize());
@@ -95,7 +148,7 @@ int main(int argc, char** argv) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (size_t i = 0; i < num_iter; i++) {
-        hipLaunchKernelGGL((memoryBandwidthKernel<DataType>), grids, blocks,
+        hipLaunchKernelGGL(kernel, grids, blocks,
                            threads_per_block * num_chunks * sizeof(DataType), 0, d_data_a, d_data_b, num_elems, num_chunks, DataType{1.0f, 1.0f, 1.0f, 1.0f});
     }
     CHECK_HIP_ERROR(hipDeviceSynchronize());
@@ -107,7 +160,10 @@ int main(int argc, char** argv) {
     std::chrono::duration<double> elapsed = end - start;
 
     // Calculate bandwidth (in GB/s)
-    double total_bytes = static_cast<double>(num_elems * sizeof(DataType) * num_iter * 2); // Read? Write? Read + Write?
+    double total_bytes = static_cast<double>(num_elems * sizeof(DataType) * num_iter * 1);
+    if (test_type == 0) {
+        total_bytes *= 2;
+    }
     double bandwidth = total_bytes / elapsed.count() / 1e9;
 
     std::cout << "Elapsed time: " << elapsed.count() << " seconds" << std::endl;
