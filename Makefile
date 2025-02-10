@@ -54,7 +54,9 @@ $(MEM): main.cpp
 	$(HIPCXX) $(ICXXFLAGS) $(ICPPFLAGS) $(ILDFLAGS) -o $@ $< $(ILDLIBS)
 
 clean:
-	$(RM) $(EXAMPLE)
+	rm -f main-h*
+	rm -f main.cpp-h*
+	rm -f $(MEM)
 
 .PHONY: clean
 
